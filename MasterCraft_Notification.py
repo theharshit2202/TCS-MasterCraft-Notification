@@ -353,12 +353,9 @@ class WebDriverManager:
             self.driver.maximize_window()
             self.original_window = self.driver.current_window_handle
             logging.info("WebDriver initialized successfully")
-        except SessionNotCreatedException as e:
-            logging.error("Failed to create WebDriver session. Please check Edge WebDriver installation.")
-            raise WebDriverError(f"Session creation failed: {e}")
-        except WebDriverException as e:
-            logging.error("Failed to initialize WebDriver")
-            raise WebDriverError(f"WebDriver initialization failed: {e}")
+        except (SessionNotCreatedException, WebDriverException, Exception) as e:
+            logging.error(f"Failed to initialize WebDriver: {e}")
+            self.driver = None
 
     def wait_for_element(self, by: By, value: str, timeout: Optional[int] = None) -> webdriver.remote.webelement.WebElement:
         """Waits for an element to be visible."""
@@ -529,50 +526,70 @@ class MasterCraftNotifier:
     def run(self) -> None:
         """Main execution method."""
         try:
-            self.web_driver.initialize_driver()
+            try:
+                self.web_driver.initialize_driver()
+            except Exception as e:
+                logging.error(f"WebDriver could not be initialized: {e}")
             self.pause_manager.start_console_listener()
             
             # Try primary URL, fall back to secondary if needed
             try:
                 self.web_driver.driver.get(self.config.base_url)
                 logging.info(f"Successfully loaded primary URL: {self.config.base_url}")
-            except WebDriverError as e:
+            except Exception as e:
                 logging.error(f"Failed to load primary URL: {e}")
                 try:
                     self.web_driver.driver.get(self.config.fallback_url)
                     logging.info(f"Successfully loaded fallback URL: {self.config.fallback_url}")
-                except WebDriverError as e:
+                except Exception as e:
                     logging.error(f"Failed to load fallback URL: {e}")
-                    return
             
             # Switch to new window if needed
-            self.web_driver.driver.switch_to.window(self.web_driver.driver.window_handles[-1])
-            if self.web_driver.original_window != self.web_driver.driver.current_window_handle:
-                self.web_driver.driver.maximize_window()
-                logging.info("Switched to new window and maximized")
+            try:
+                self.web_driver.driver.switch_to.window(self.web_driver.driver.window_handles[-1])
+                if self.web_driver.original_window != self.web_driver.driver.current_window_handle:
+                    self.web_driver.driver.maximize_window()
+                    logging.info("Switched to new window and maximized")
+            except Exception as e:
+                logging.error(f"Error switching window: {e}")
             
             # Perform login and setup
-            self.web_driver.login()
-            self.web_driver.navigate_to_defects()
-            self.web_driver.enter_owner_details()
+            try:
+                self.web_driver.login()
+            except Exception as e:
+                logging.error(f"Login failed: {e}")
+            try:
+                self.web_driver.navigate_to_defects()
+            except Exception as e:
+                logging.error(f"Navigation to defects failed: {e}")
+            try:
+                self.web_driver.enter_owner_details()
+            except Exception as e:
+                logging.error(f"Entering owner details failed: {e}")
             
             # Main monitoring loop
             while not self.pause_manager.should_stop():
                 try:
                     if not self.pause_manager.is_paused():
-                        seconds = self.web_driver.check_new_defects()
+                        try:
+                            seconds = self.web_driver.check_new_defects()
+                        except Exception as e:
+                            logging.error(f"Error checking new defects: {e}")
+                            seconds = 60
                         time.sleep(seconds)
                     else:
                         time.sleep(10)  # Check pause status every 10 seconds
-                except WebDriverError as e:
+                except Exception as e:
                     logging.error(f"Error in monitoring loop: {e}")
                     time.sleep(60)  # Wait a minute before retrying
-                
         except Exception as e:
             logging.exception("An error occurred during execution")
         finally:
             self.pause_manager.stop_console_listener()
-            self.web_driver.cleanup()
+            try:
+                self.web_driver.cleanup()
+            except Exception as e:
+                logging.error(f"Error during cleanup: {e}")
             logging.info("Program completed")
 
 
