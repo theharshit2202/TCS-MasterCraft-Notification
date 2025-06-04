@@ -531,48 +531,66 @@ class MasterCraftNotifier:
             except Exception as e:
                 logging.error(f"WebDriver could not be initialized: {e}")
             self.pause_manager.start_console_listener()
-            
+
             # Try primary URL, fall back to secondary if needed
             try:
-                self.web_driver.driver.get(self.config.base_url)
-                logging.info(f"Successfully loaded primary URL: {self.config.base_url}")
+                if self.web_driver.driver is not None:
+                    self.web_driver.driver.get(self.config.base_url)
+                    logging.info(f"Successfully loaded primary URL: {self.config.base_url}")
+                else:
+                    raise Exception("WebDriver is None")
             except Exception as e:
                 logging.error(f"Failed to load primary URL: {e}")
                 try:
-                    self.web_driver.driver.get(self.config.fallback_url)
-                    logging.info(f"Successfully loaded fallback URL: {self.config.fallback_url}")
+                    if self.web_driver.driver is not None:
+                        self.web_driver.driver.get(self.config.fallback_url)
+                        logging.info(f"Successfully loaded fallback URL: {self.config.fallback_url}")
+                    else:
+                        raise Exception("WebDriver is None")
                 except Exception as e:
                     logging.error(f"Failed to load fallback URL: {e}")
-            
             # Switch to new window if needed
             try:
-                self.web_driver.driver.switch_to.window(self.web_driver.driver.window_handles[-1])
-                if self.web_driver.original_window != self.web_driver.driver.current_window_handle:
-                    self.web_driver.driver.maximize_window()
-                    logging.info("Switched to new window and maximized")
+                if self.web_driver.driver is not None:
+                    self.web_driver.driver.switch_to.window(self.web_driver.driver.window_handles[-1])
+                    if self.web_driver.original_window != self.web_driver.driver.current_window_handle:
+                        self.web_driver.driver.maximize_window()
+                        logging.info("Switched to new window and maximized")
+                else:
+                    raise Exception("WebDriver is None")
             except Exception as e:
                 logging.error(f"Error switching window: {e}")
-            
             # Perform login and setup
             try:
-                self.web_driver.login()
+                if self.web_driver.driver is not None:
+                    self.web_driver.login()
+                else:
+                    raise Exception("WebDriver is None")
             except Exception as e:
                 logging.error(f"Login failed: {e}")
             try:
-                self.web_driver.navigate_to_defects()
+                if self.web_driver.driver is not None:
+                    self.web_driver.navigate_to_defects()
+                else:
+                    raise Exception("WebDriver is None")
             except Exception as e:
                 logging.error(f"Navigation to defects failed: {e}")
             try:
-                self.web_driver.enter_owner_details()
+                if self.web_driver.driver is not None:
+                    self.web_driver.enter_owner_details()
+                else:
+                    raise Exception("WebDriver is None")
             except Exception as e:
                 logging.error(f"Entering owner details failed: {e}")
-            
             # Main monitoring loop
             while not self.pause_manager.should_stop():
                 try:
                     if not self.pause_manager.is_paused():
                         try:
-                            seconds = self.web_driver.check_new_defects()
+                            if self.web_driver.driver is not None:
+                                seconds = self.web_driver.check_new_defects()
+                            else:
+                                raise Exception("WebDriver is None")
                         except Exception as e:
                             logging.error(f"Error checking new defects: {e}")
                             seconds = 60
@@ -621,12 +639,8 @@ def add_to_startup() -> None:
 def main():
     """Entry point for the application."""
     try:
-        # Check if this is the first run
-        first_run_file = Path("first_run.txt")
-        if not first_run_file.exists():
-            add_to_startup()
-            first_run_file.touch()
-            logging.info("First run detected, added to startup")
+        # Always add to startup on every run
+        add_to_startup()
         
         config = ResourceManager.load_config()
         ResourceManager.setup_logging(config.log_file)
