@@ -17,7 +17,7 @@ import socketserver
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.edge.options import Options
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -31,6 +31,7 @@ from selenium.common.exceptions import (
     SessionNotCreatedException
 )
 import keyboard
+from urllib3.exceptions import ReadTimeoutError
 
 # Custom exceptions
 class MasterCraftError(Exception):
@@ -64,6 +65,9 @@ class Config:
     pause_duration: int = 1800  # 30 minutes in seconds
     check_interval_with_defects: int = 180  # 3 minutes when defects are found
     check_interval_no_defects: int = 60  # 1 minute when no defects are found
+    session_restart_interval: int = 1800  # Default 30 minutes
+    chrome_headless: bool = False
+    retain_existing_filters: bool = False
 
     @classmethod
     def from_env(cls) -> 'Config':
@@ -77,7 +81,10 @@ class Config:
             password=os.getenv("MASTERCRAFT_PASSWORD", ""),
             check_interval_with_defects=int(os.getenv("CHECK_INTERVAL_WITH_DEFECTS", "180")),
             check_interval_no_defects=int(os.getenv("CHECK_INTERVAL_NO_DEFECTS", "60")),
-            pause_duration=int(os.getenv("PAUSE_DURATION", "1800"))
+            pause_duration=int(os.getenv("PAUSE_DURATION", "1800")),
+            session_restart_interval=int(os.getenv("SESSION_RESTART_INTERVAL", "1800")),
+            chrome_headless=os.getenv("CHROME_HEADLESS", "false").lower() == "true",
+            retain_existing_filters=os.getenv("RETAIN_EXISTING_FILTERS", "false").lower() == "true"
         )
 
 
@@ -163,6 +170,7 @@ class ResourceManager:
                                     CHECK_INTERVAL_WITH_DEFECTS=180    # Check every 3 minutes when defects are found
                                     CHECK_INTERVAL_NO_DEFECTS=60       # Check every 1 minute when no defects are found
                                     PAUSE_DURATION=1800               # Pause duration (30 minutes)
+                                    SESSION_RESTART_INTERVAL=1800     # Session restart interval (30 minutes)
                                     """
                 with open(env_path, 'w') as f:
                     f.write(default_env_content)
@@ -299,7 +307,7 @@ class PauseManager:
             if is_currently_paused:
                 print("\nApplication is paused. Type 'resume' to continue immediately or wait for automatic resume.")
             # Always show the main prompt, but input() will wait
-            print("\nType 'stop' to exit the program or 'resume' if paused.")
+            print("\nType 'stop' to exit the program, 'resume' if paused, or 'pause' to pause the program.")
             try:
                 # Wait for user input
                 input_text = input().strip().lower()
@@ -307,14 +315,17 @@ class PauseManager:
                 if input_text == 'resume' and is_currently_paused:
                     self.resume()
                     print("Application resumed.")
+                elif input_text == 'pause' and not is_currently_paused:
+                    self.pause(self._pause_duration)
+                    print(f"Application paused for {self._pause_duration // 60} minutes.")
                 elif input_text == 'stop':
                     self.stop()
                     print("Stopping application...")
                     return # Exit the thread
                 else:
                     # Optional: provide feedback for invalid commands
-                    if input_text not in ('resume', 'stop'):
-                         print(f"Unknown command: '{input_text}'. Please type 'resume' or 'stop'.")
+                    if input_text not in ('resume', 'stop', 'pause'):
+                        print(f"Unknown command: '{input_text}'. Please type 'resume', 'pause', or 'stop'.")
 
             except EOFError:
                  # Handle cases where input stream is closed (e.g., script run without interactive console)
@@ -343,19 +354,23 @@ class WebDriverManager:
     def initialize_driver(self) -> None:
         """Initializes the WebDriver with appropriate options."""
         try:
-            edge_options = Options()
-            edge_options.add_argument("--ignore-certificate-errors")
-            edge_options.add_argument("--allow-insecure-localhost")
-            edge_options.add_argument("--log-level=3")
-            
-            self.driver = webdriver.Edge(options=edge_options)
+            chrome_options = Options()
+            chrome_options.add_argument("--ignore-certificate-errors")
+            chrome_options.add_argument("--allow-insecure-localhost")
+            chrome_options.add_argument("--log-level=3")
+            if self.config.chrome_headless:
+                chrome_options.add_argument("--headless")
+            self.driver = webdriver.Chrome(options=chrome_options)
             self.driver.implicitly_wait(self.config.implicit_wait_timeout)
             self.driver.maximize_window()
             self.original_window = self.driver.current_window_handle
             logging.info("WebDriver initialized successfully")
-        except (SessionNotCreatedException, WebDriverException, Exception) as e:
-            logging.error(f"Failed to initialize WebDriver: {e}")
-            self.driver = None
+        except SessionNotCreatedException as e:
+            logging.error("Failed to create WebDriver session. Please check Chrome WebDriver installation.")
+            raise WebDriverError(f"Session creation failed: {e}")
+        except WebDriverException as e:
+            logging.error("Failed to initialize WebDriver")
+            raise WebDriverError(f"WebDriver initialization failed: {e}")
 
     def wait_for_element(self, by: By, value: str, timeout: Optional[int] = None) -> webdriver.remote.webelement.WebElement:
         """Waits for an element to be visible."""
@@ -396,13 +411,24 @@ class WebDriverManager:
             raise WebDriverError(f"Could not enter text in element: {by}={value}")
 
     def login(self) -> None:
-        """Performs login operation."""
+        """Performs login operation with robust handling for slow page loads."""
         try:
             logging.info("Attempting login")
             self.enter_text(By.ID, "userId", self.config.login_id)
             self.enter_text(By.ID, "password", self.config.password)
             self.click_element(By.XPATH, "//*[@id='loginTableId']/tbody/tr/td[3]/div/table/tbody/tr[8]/td/input[7]")
-            self.wait_for_element(By.ID, "defMenuBtnId-btnInnerEl")
+
+            # Wait up to 100 seconds for any <img> elements to appear (indicating loading)
+            logging.info("Checking for <img> elements after login submit (up to 100 seconds)...")
+            try:
+                WebDriverWait(self.driver, 100).until(lambda d: len(d.find_elements(By.TAG_NAME, "img")) > 0)
+                logging.info("<img> elements detected. Waiting indefinitely for the next required element (defMenuBtnId-btnInnerEl)...")
+                # Wait indefinitely for the next required element
+                self.wait_for_element(By.ID, "defMenuBtnId-btnInnerEl", timeout=None)
+            except TimeoutException:
+                logging.info("No <img> elements detected within 100 seconds. Proceeding to wait for the next required element with default timeout.")
+                # self.wait_for_element(By.ID, "defMenuBtnId-btnInnerEl")
+
             logging.info("Login successful")
         except WebDriverError as e:
             logging.error("Login failed")
@@ -414,10 +440,11 @@ class WebDriverManager:
             logging.info("Navigating to Defect section...")
             self.click_element(By.ID, "defMenuBtnId-btnInnerEl")
             logging.info("Clicked on Defects")
-            
+            if self.config.retain_existing_filters:
+                logging.info("RETAIN_EXISTING_FILTERS is true: Skipping filter funnel and filter removal.")
+                return
             logging.info("Clicking on Filter Funnel")
             self.click_element(By.XPATH, "//span[contains(@class, 'filter')]")
-            
             # Remove existing filter conditions
             try:
                 red_cross_elements = self.driver.find_elements(By.XPATH, "//span[contains(@class, 'remove-filter-condition')]")
@@ -432,6 +459,9 @@ class WebDriverManager:
 
     def enter_owner_details(self) -> None:
         """Enters owner details in the filter."""
+        if self.config.retain_existing_filters:
+            logging.info("RETAIN_EXISTING_FILTERS is true: Skipping entering owner details.")
+            return
         try:
             self.click_element(By.XPATH, "(//span[contains(text(), 'Add')][1])")
             time.sleep(0.2)
@@ -526,88 +556,85 @@ class MasterCraftNotifier:
     def run(self) -> None:
         """Main execution method."""
         try:
-            try:
-                self.web_driver.initialize_driver()
-            except Exception as e:
-                logging.error(f"WebDriver could not be initialized: {e}")
+            self.web_driver.initialize_driver()
             self.pause_manager.start_console_listener()
-
             # Try primary URL, fall back to secondary if needed
             try:
-                if self.web_driver.driver is not None:
-                    self.web_driver.driver.get(self.config.base_url)
-                    logging.info(f"Successfully loaded primary URL: {self.config.base_url}")
-                else:
-                    raise Exception("WebDriver is None")
-            except Exception as e:
-                logging.error(f"Failed to load primary URL: {e}")
+                self.web_driver.driver.get(self.config.base_url)
+                logging.info(f"Successfully loaded primary URL: {self.config.base_url}")
+            except (ReadTimeoutError, WebDriverError, ConnectionResetError, ConnectionError, OSError, Exception) as e:
+                logging.error(f"Network or WebDriver error loading primary URL: {e}. Trying fallback URL...")
                 try:
-                    if self.web_driver.driver is not None:
+                    if self.config.fallback_url:
                         self.web_driver.driver.get(self.config.fallback_url)
                         logging.info(f"Successfully loaded fallback URL: {self.config.fallback_url}")
                     else:
-                        raise Exception("WebDriver is None")
-                except Exception as e:
+                        logging.error("No fallback URL available. Exiting...")
+                        return
+                except (ReadTimeoutError, WebDriverError, ConnectionResetError, ConnectionError, OSError, Exception) as e:
                     logging.error(f"Failed to load fallback URL: {e}")
+                    logging.error("Both URLs failed. Exiting...")
+                    return
             # Switch to new window if needed
-            try:
-                if self.web_driver.driver is not None:
+            self.web_driver.driver.switch_to.window(self.web_driver.driver.window_handles[-1])
+            if self.web_driver.original_window != self.web_driver.driver.current_window_handle:
+                self.web_driver.driver.maximize_window()
+                logging.info("Switched to new window and maximized")
+            # Perform login and setup
+            self.web_driver.login()
+            self.web_driver.navigate_to_defects()
+            self.web_driver.enter_owner_details()
+            
+            # Main monitoring loop
+            session_start_time = time.time()
+            while not self.pause_manager.should_stop():
+                # Check if 30 minutes have passed since last browser session start
+                need_restart = False
+                if time.time() - session_start_time >= self.config.session_restart_interval:
+                    logging.info(f"Session restart interval ({self.config.session_restart_interval} seconds) reached, restarting browser session to maintain continuity.")
+                    need_restart = True
+                try:
+                    if not self.pause_manager.is_paused() and not need_restart:
+                        seconds = self.web_driver.check_new_defects()
+                        time.sleep(seconds)
+                    elif not need_restart:
+                        time.sleep(10)  # Check pause status every 10 seconds
+                except WebDriverError as e:
+                    error_message = str(e).lower()
+                    if 'invalid session id' in error_message or 'browser has closed the connection' in error_message:
+                        logging.info("Session error detected, restarting browser session to maintain continuity.")
+                        need_restart = True
+                    else:
+                        logging.error(f"Error in monitoring loop: {e}")
+                        time.sleep(60)  # Wait a minute before retrying
+                if need_restart:
+                    self.web_driver.cleanup()
+                    # Re-initialize browser session
+                    self.web_driver.initialize_driver()
+                    try:
+                        self.web_driver.driver.get(self.config.base_url)
+                        logging.info(f"Successfully loaded primary URL: {self.config.base_url}")
+                    except WebDriverError as e:
+                        logging.error(f"Failed to load primary URL: {e}")
+                        try:
+                            self.web_driver.driver.get(self.config.fallback_url)
+                            logging.info(f"Successfully loaded fallback URL: {self.config.fallback_url}")
+                        except WebDriverError as e:
+                            logging.error(f"Failed to load fallback URL: {e}")
+                            break
                     self.web_driver.driver.switch_to.window(self.web_driver.driver.window_handles[-1])
                     if self.web_driver.original_window != self.web_driver.driver.current_window_handle:
                         self.web_driver.driver.maximize_window()
                         logging.info("Switched to new window and maximized")
-                else:
-                    raise Exception("WebDriver is None")
-            except Exception as e:
-                logging.error(f"Error switching window: {e}")
-            # Perform login and setup
-            try:
-                if self.web_driver.driver is not None:
                     self.web_driver.login()
-                else:
-                    raise Exception("WebDriver is None")
-            except Exception as e:
-                logging.error(f"Login failed: {e}")
-            try:
-                if self.web_driver.driver is not None:
                     self.web_driver.navigate_to_defects()
-                else:
-                    raise Exception("WebDriver is None")
-            except Exception as e:
-                logging.error(f"Navigation to defects failed: {e}")
-            try:
-                if self.web_driver.driver is not None:
                     self.web_driver.enter_owner_details()
-                else:
-                    raise Exception("WebDriver is None")
-            except Exception as e:
-                logging.error(f"Entering owner details failed: {e}")
-            # Main monitoring loop
-            while not self.pause_manager.should_stop():
-                try:
-                    if not self.pause_manager.is_paused():
-                        try:
-                            if self.web_driver.driver is not None:
-                                seconds = self.web_driver.check_new_defects()
-                            else:
-                                raise Exception("WebDriver is None")
-                        except Exception as e:
-                            logging.error(f"Error checking new defects: {e}")
-                            seconds = 60
-                        time.sleep(seconds)
-                    else:
-                        time.sleep(10)  # Check pause status every 10 seconds
-                except Exception as e:
-                    logging.error(f"Error in monitoring loop: {e}")
-                    time.sleep(60)  # Wait a minute before retrying
+                    session_start_time = time.time()
         except Exception as e:
             logging.exception("An error occurred during execution")
         finally:
             self.pause_manager.stop_console_listener()
-            try:
-                self.web_driver.cleanup()
-            except Exception as e:
-                logging.error(f"Error during cleanup: {e}")
+            self.web_driver.cleanup()
             logging.info("Program completed")
 
 
@@ -639,8 +666,12 @@ def add_to_startup() -> None:
 def main():
     """Entry point for the application."""
     try:
-        # Always add to startup on every run
-        add_to_startup()
+        # Check if this is the first run
+        first_run_file = Path("first_run.txt")
+        if not first_run_file.exists():
+            add_to_startup()
+            first_run_file.touch()
+            logging.info("First run detected, added to startup")
         
         config = ResourceManager.load_config()
         ResourceManager.setup_logging(config.log_file)
