@@ -50,6 +50,12 @@ class NotificationError(MasterCraftError):
     """Raised when there's an error with system notifications."""
     pass
 
+def get_exe_dir():
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).parent
+    else:
+        return Path(__file__).resolve().parent
+
 @dataclass
 class Config:
     """Configuration settings for the application."""
@@ -72,6 +78,7 @@ class Config:
     @classmethod
     def from_env(cls) -> 'Config':
         """Create Config instance from environment variables."""
+        exe_dir = get_exe_dir()
         return cls(
             base_url=os.getenv("BASE_URL", ""),
             fallback_url=os.getenv("FALLBACK_URL", ""),
@@ -84,7 +91,8 @@ class Config:
             pause_duration=int(os.getenv("PAUSE_DURATION", "1800")),
             session_restart_interval=int(os.getenv("SESSION_RESTART_INTERVAL", "1800")),
             chrome_headless=os.getenv("CHROME_HEADLESS", "false").lower() == "true",
-            retain_existing_filters=os.getenv("RETAIN_EXISTING_FILTERS", "false").lower() == "true"
+            retain_existing_filters=os.getenv("RETAIN_EXISTING_FILTERS", "false").lower() == "true",
+            log_file=str(exe_dir / "selenium_errors.log")
         )
 
 
@@ -118,14 +126,14 @@ class ResourceManager:
     def setup_logging(log_file: str) -> None:
         """Sets up logging configuration with enhanced formatting."""
         try:
-            # Ensure log directory and file exist
-            ResourceManager.ensure_log_directory(log_file)
-            
-            # Add separator for new run
+            log_path = Path(log_file)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            if not log_path.exists():
+                log_path.touch()
+                logging.info(f"Created new log file at: {log_path}")
             with open(log_file, 'a') as f:
                 f.write(f"\n{'#'*50}\nNew Run Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{'#'*50}\n")
             
-            # Configure logging
             logging.basicConfig(
                 filename=log_file,
                 level=logging.DEBUG,
@@ -638,41 +646,9 @@ class MasterCraftNotifier:
             logging.info("Program completed")
 
 
-def add_to_startup() -> None:
-    """Add the program to Windows startup."""
-    try:
-        # Get the path of the executable
-        if getattr(sys, 'frozen', False):
-            exe_path = sys.executable
-        else:
-            exe_path = os.path.abspath(__file__)
-        
-        # Create a shortcut in the startup folder
-        startup_folder = os.path.join(
-            os.getenv('APPDATA'),
-            'Microsoft\\Windows\\Start Menu\\Programs\\Startup'
-        )
-        
-        # Create a .bat file to run the program
-        bat_path = os.path.join(startup_folder, 'MasterCraft_Notification.bat')
-        with open(bat_path, 'w') as f:
-            f.write(f'@echo off\nstart "" "{exe_path}"\n')
-        
-        logging.info(f"Added program to startup at: {bat_path}")
-    except Exception as e:
-        logging.error(f"Failed to add program to startup: {e}")
-
-
 def main():
     """Entry point for the application."""
     try:
-        # Check if this is the first run
-        first_run_file = Path("first_run.txt")
-        if not first_run_file.exists():
-            add_to_startup()
-            first_run_file.touch()
-            logging.info("First run detected, added to startup")
-        
         config = ResourceManager.load_config()
         ResourceManager.setup_logging(config.log_file)
         notifier = MasterCraftNotifier()
